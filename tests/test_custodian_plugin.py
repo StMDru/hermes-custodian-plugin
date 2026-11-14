@@ -535,11 +535,18 @@ class TestFixEngine:
         assert engine.dry_run is True
 
     def test_fix_cron_disabled_transient(self, tmp_storage):
+        """The handler mutates nothing, so it must not claim success.
+
+        Every cron handler used to return success=True without running anything, which
+        made the report say "N fixed" for jobs it never touched.
+        """
         engine = FixEngine(tmp_storage, dry_run=True)
         result = engine.apply_fix("oc_cron_disabled_transient", {"job_id": "abc123"})
         assert result is not None
         assert result["fingerprint"] == "oc_cron_disabled_transient"
-        assert result["success"] is True
+        assert result["success"] is False
+        assert "NO AUTO-FIX" in result["description"]
+        assert "abc123" in result["command"]
 
     def test_fix_cron_stuck_missed(self, tmp_storage):
         engine = FixEngine(tmp_storage, dry_run=True)
@@ -626,16 +633,23 @@ class TestFixEngine:
             {"fingerprint_id": "oc_http_429_rate_limit"},  # No fix
         ]
         applied, failed = engine.apply_all(issues)
-        assert len(applied) == 2
-        assert len(failed) == 0
+        # No cron handler mutates state, so every issue is reported as not-fixed with
+        # an actionable command rather than silently counted as "applied".
+        assert len(applied) == 0
+        assert len(failed) == 2
 
     def test_fix_map_has_15_entries(self):
         assert len(FixEngine._FIX_MAP) >= 15
 
     def test_get_applied_fixes(self, tmp_storage):
         engine = FixEngine(tmp_storage, dry_run=True)
-        engine.apply_fix("oc_cron_disabled_transient", {"job_id": "j1"})
-        assert len(engine.get_applied_fixes()) == 1
+        result = engine.apply_fix("oc_cron_disabled_transient", {"job_id": "j1"})
+        assert result is not None
+        # An honest refusal reaches storage under neither list's "applied" meaning:
+        # get_applied_fixes() is what a later run may treat as done, and nothing is.
+        assert len(engine.get_applied_fixes()) == 0
+        assert len(engine.get_failed_fixes()) == 1
+        assert "NO AUTO-FIX" in result["description"]
 
     def test_fix_result_has_required_fields(self, tmp_storage):
         engine = FixEngine(tmp_storage, dry_run=True)
@@ -1102,8 +1116,10 @@ class TestIntegration:
         # 3. Fix (dry run)
         engine = FixEngine(tmp_storage, dry_run=True)
         applied, failed = engine.apply_all(scan_result.issues)
-        # At least some Tier 1 issues should have fixes
-        assert len(applied) >= 1
+        # Every handler is an honest refusal now, so nothing is auto-applied — but each
+        # issue must still reach the journal as a failed fix with a manual command.
+        assert len(applied) == 0
+        assert len(failed) == len(scan_result.issues)
 
     def test_scan_journal_fix_pipeline(self, tmp_storage):
         """Scan → journal → fix → verify."""
@@ -1120,9 +1136,11 @@ class TestIntegration:
             )
 
         engine = FixEngine(tmp_storage, dry_run=True)
-        applied, _ = engine.apply_all(scan_result.issues)
+        applied, failed = engine.apply_all(scan_result.issues)
 
-        for fix in applied:
+        # Honest refusals land in the journal too: the report must show what was
+        # attempted and what the operator has to run, so both lists are journalled.
+        for fix in (applied + failed):
             journal.add_action(
                 fix["fingerprint"],
                 fix["fix_id"],

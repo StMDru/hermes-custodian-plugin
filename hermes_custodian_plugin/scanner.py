@@ -90,7 +90,16 @@ KNOWN_FINGERPRINTS: List[Dict[str, Any]] = [
         "id": "oc_cron_dead_skill_ref",
         "description": "Cron job references a skill directory that does not exist",
         "tier": 1,
-        "match_patterns": [r"skill.*not found", r"skill directory.*missing", r"no such file.*skills/"],
+        # A bare `skill.*not found` matched EVERY failed skill_view, including interactive
+        # ones where the agent simply guessed a wrong name. Verified 14.11.2026: both
+        # reported "dead cron skill" hits were an interactive session (and one was this
+        # very report session probing the plugin skill), not a cron job. Same class of
+        # bug as oc_cron_timeout — anchor on the cron emitters.
+        "match_patterns": [
+            r"cron\.scheduler:[^\n]*skill[^\n]*not found",
+            r"\[cron_[a-f0-9]+_[0-9_]+\][^\n]*[Ss]kill[^\n]*not found",
+            r"cron\.scheduler:[^\n]*skill directory[^\n]*missing",
+        ],
         "source": "cron_log",
         "auto_fix": "Remove dead skill reference from job's skills array, or delete job",
     },
@@ -240,7 +249,17 @@ KNOWN_FINGERPRINTS: List[Dict[str, Any]] = [
         "id": "oc_cron_rate_limit_429",
         "description": "Cron job hit HTTP 429 rate limit",
         "tier": 2,
-        "match_patterns": [r"HTTP 429", r"429.*rate.limit", r"too many concurrent requests"],
+        # A bare `HTTP 429` / `429.*rate.limit` matched EVERY provider rate-limit line
+        # in agent.log, including the auxiliary-approval ones (`Auxiliary approval:
+        # rate limit on zai …`, `Smart approvals: LLM call failed …`) that belong to
+        # interactive sessions, not cron. Verified 14.11.2026: 3 of 3 escalated
+        # "cron" 429s came from auxiliary approval inside a Telegram session, and the
+        # one dated cron 429 was 2026-11-07 (outside the 168 h window) — so the
+        # report named a cron defect that did not exist. Anchor on the cron emitters.
+        "match_patterns": [
+            r"cron\.scheduler:[^\n]*(?:HTTP 429|Error code: 429|RateLimitError)",
+            r"\[cron_[a-f0-9]+_[0-9_]+\][^\n]*(?:HTTP 429|Error code: 429)",
+        ],
         "source": "cron_log",
         "auto_fix": "Stagger cron schedules or reduce max_parallel_jobs",
     },
@@ -296,7 +315,17 @@ KNOWN_FINGERPRINTS: List[Dict[str, Any]] = [
         "id": "oc_http_401_nous_api_key",
         "description": "Http 401 from Nous API — bypass expired credential",
         "tier": 1,
-        "match_patterns": [r"401.*nous", r"Nous.*credential.*expired"],
+        # A bare `401.*nous` matched any log line whose millisecond timestamp contained
+        # "401" followed by the word "nous" — e.g. `14:00:54,401 … image_gen provider:
+        # nous`. Verified 14.11.2026: the single reported "nous 401" was exactly that
+        # INFO registration line, i.e. a 100% false positive from a timestamp. Require
+        # the HTTP status word and the provider to be adjacent.
+        "match_patterns": [
+            r"\bHTTP 401\b[^\n]*nous",
+            r"401 (?:Unauthorized|from)[^\n]*nous",
+            r"nous[^\n]{0,60}credential[^\n]{0,30}(?:expired|revoked|invalid)",
+            r"nous[^\n]{0,40}(?:401|Unauthorized)",
+        ],
         "source": "cron_log",
         "auto_fix": "Set auxiliary provider to openrouter in config.yaml",
     },
@@ -359,9 +388,18 @@ NON_FATAL_FINGERPRINTS: List[Dict[str, Any]] = [
     },
     {
         "id": "oc_state_db_oversized",
-        "description": "state.db exceeds 10GB",
+        "description": "Logs report state.db in the gigabyte range (>=10GB) — genuine bloat, not a read_file limit",
         "tier": 2,
-        "match_patterns": [r"state\.db.*(oversized|too large|10GB)"],
+        # The old pattern included a bare `too large`, which fired on read_file's OWN
+        # message "File is too large (310,579,200 bytes, limit is 52,428,800)" — that is
+        # read_extract.MAX_DOCUMENT_BYTES (50 MB), the cap on previewing a .db as text,
+        # and says nothing about the database. Measured: 2 of 2 matches were that line at
+        # 301 MB / 310 MB, i.e. a 100% false-positive rate and ~33x below the real 10GB
+        # threshold. Require an explicit gigabyte figure so only real bloat escalates.
+        "match_patterns": [
+            r"state\.db[^\n]{0,120}\boversized\b",
+            r"state\.db[^\n]{0,120}\b\d{2,}(?:\.\d+)?\s?GB\b",
+        ],
         "source": "ocas_data",
     },
     {
@@ -584,6 +622,7 @@ def scan_files(file_paths: List[Path], fingerprints: Optional[List[Dict]] = None
     drops stale matches so a resolved error stops re-reporting every cycle.
     """
     combined = ScanResult()
+    seen: set = set()
     for path in file_paths:
         try:
             if not path.exists():
@@ -593,7 +632,15 @@ def scan_files(file_paths: List[Path], fingerprints: Optional[List[Dict]] = None
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             result = scan_text(text, fingerprints, max_age_hours=max_age_hours)
-            combined.issues.extend(result.issues)
+            # The gateway writes the same event into agent.log AND errors.log, so a naive
+            # concatenation reports every finding twice (verified 14.11.2026: 8 findings
+            # were 4 distinct events). Dedupe on the identity of the event itself.
+            for issue in result.issues:
+                key = (issue.get("fingerprint_id"), issue.get("evidence"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                combined.issues.append(issue)
             combined.fingerprints_matched.extend(result.fingerprints_matched)
             combined.errors.extend(result.errors)
             combined.sources_scanned.append(str(path))

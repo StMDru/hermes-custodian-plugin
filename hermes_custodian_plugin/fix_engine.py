@@ -45,64 +45,81 @@ class FixEngine:
     # Individual fix handlers
     # ------------------------------------------------------------------
 
+    # NOTE (14.11.2026): every handler below used to call ``_record`` and return
+    # ``success=True`` without running anything — no subprocess, no file write. The
+    # deep scan therefore reported "N fixed" for jobs it never touched, and
+    # fix_effectiveness stayed empty so every fingerprint scored confidence=0.00.
+    # Verified: apply=true on oc_cron_dead_skill_ref left jobs.json byte-identical and
+    # wrote no storage files, yet returned success. These are now honest: they report
+    # ``success=False`` with ``actionable`` text, so the report says "no auto-fix"
+    # instead of inventing one. Implement a real mutation here before flipping any of
+    # them back to success=True — and add a test that asserts the side effect.
+
+    def _no_autofix(self, fingerprint: str, command: str, reason: str) -> FixResult:
+        """Record a finding that this engine cannot repair automatically."""
+        return self._record(fingerprint, command, f"NO AUTO-FIX: {reason}", success=False)
+
     def fix_cron_disabled_transient(self, issue: Dict) -> FixResult:
-        """Re-enable a disabled cron job."""
+        """Re-enable a disabled cron job (manual — needs a `hermes cron resume`)."""
         job_id = issue.get("job_id", "")
-        return self._record("oc_cron_disabled_transient",
-                            f"hermes cron resume {job_id}",
-                            f"Re-enable disabled job {job_id}")
+        return self._no_autofix("oc_cron_disabled_transient",
+                                f"hermes cron resume {job_id}",
+                                "job state is owned by the scheduler; resume manually")
 
     def fix_cron_stuck_missed(self, issue: Dict) -> FixResult:
-        """Force-run a missed cron job."""
+        """Force-run a missed cron job (manual — needs `hermes cron run`)."""
         job_id = issue.get("job_id", "")
-        return self._record("oc_cron_stuck_missed",
-                            f"hermes cron run {job_id}",
-                            f"Force-run missed job {job_id}")
+        return self._no_autofix("oc_cron_stuck_missed",
+                                f"hermes cron run {job_id}",
+                                "re-firing a job can duplicate side effects; run manually")
 
     def fix_cron_no_agent_mismatch(self, issue: Dict) -> FixResult:
-        """Remove and re-create a cron job with scheduler state mismatch."""
+        """Reset scheduler state mismatch (manual — destructive re-create)."""
         job_id = issue.get("job_id", "")
-        return self._record("oc_cron_no_agent_mismatch",
-                            f"hermes cron remove {job_id} && hermes cron add (re-create)",
-                            f"Reset scheduler state for job {job_id}")
+        return self._no_autofix("oc_cron_no_agent_mismatch",
+                                f"hermes cron remove {job_id} && hermes cron add (re-create)",
+                                "re-creating a job destroys its history; do it by hand")
 
     def fix_cron_dead_skill_ref(self, issue: Dict) -> FixResult:
-        """Remove dead skill reference from job's skills array."""
+        """Remove dead skill reference from job's skills array (manual)."""
         job_id = issue.get("job_id", "")
         skill = issue.get("skill", "")
-        return self._record("oc_cron_dead_skill_ref",
-                            f"Remove skill '{skill}' from job {job_id} skills array",
-                            f"Remove dead skill ref {skill} from {job_id}")
+        # deep_scan now attributes the job (deep_scan._attribute_job → job_id), but the
+        # offending skill NAME is still not on the finding — the log line only says
+        # "skill not found". Resolve it by re-reading the job's skills array first.
+        reason = ("job attributed but the missing skill name is not in the finding"
+                  if job_id else "job_id is not present on the finding")
+        return self._no_autofix("oc_cron_dead_skill_ref",
+                                f"hermes cron edit {job_id} --remove-skill {skill}",
+                                reason)
 
     def fix_cron_dead_script_ref(self, issue: Dict) -> FixResult:
-        """Update or delete a job referencing a dead script."""
+        """Update or delete a job referencing a dead script (manual)."""
         job_id = issue.get("job_id", "")
         script = issue.get("script", "")
         agent_root = _get_hermes_home()
-        # Check if script exists at alternative location
         alt_path = agent_root / "scripts" / Path(script).name
         if alt_path.exists():
-            return self._record("oc_cron_dead_script_ref",
-                                f"Update job {job_id} script to {alt_path}",
-                                f"Fix script path for {job_id} → {alt_path}")
-        return self._record("oc_cron_dead_script_ref",
-                            f"Delete job {job_id} (dead script {script})",
-                            f"Delete job {job_id} with missing script")
+            cmd = f"hermes cron edit {job_id} --script {alt_path.name}"
+        else:
+            cmd = f"hermes cron remove {job_id} (dead script {script})"
+        return self._no_autofix("oc_cron_dead_script_ref", cmd,
+                                "changing a job's script changes what it does; confirm first")
 
     def fix_cron_duplicate_function(self, issue: Dict) -> FixResult:
-        """Delete duplicate cron job."""
+        """Delete duplicate cron job (manual — destructive)."""
         job_id = issue.get("job_id", "")
         canonical_id = issue.get("canonical_id", "")
-        return self._record("oc_cron_duplicate_function",
-                            f"hermes cron remove {job_id} (keep {canonical_id})",
-                            f"Delete duplicate job {job_id}")
+        return self._no_autofix("oc_cron_duplicate_function",
+                                f"hermes cron remove {job_id} (keep {canonical_id})",
+                                "deleting a job is destructive; never do it unattended")
 
     def fix_cron_orphaned_job(self, issue: Dict) -> FixResult:
-        """Remove an orphaned cron job."""
+        """Remove an orphaned cron job (manual — destructive)."""
         job_id = issue.get("job_id", "")
-        return self._record("oc_cron_orphaned_job",
-                            f"hermes cron remove {job_id}",
-                            f"Remove orphaned job {job_id}")
+        return self._no_autofix("oc_cron_orphaned_job",
+                                f"hermes cron remove {job_id}",
+                                "deleting a job is destructive; never do it unattended")
 
     def fix_journal_dir_missing(self, issue: Dict) -> FixResult:
         """Create missing journal directory."""
